@@ -9003,6 +9003,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // Video-DiT shaped unmasked attention (56 heads x 128, interleaved layout, long KV)
+    for (int64_t kv : {2048, 4096}) {
+        for (int64_t nb : {512, 1000}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 56, {1, 1}, kv, nb, false, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11126,6 +11133,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // MiniMax-H3 FFN up-projection shape at ~6k tokens, candidate weight types for the B70
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 28672, 5824, 5376, {1, 1}, {1, 1}));
+    }
+    // MiniMax-H3-like unmasked attention (42 heads x 128, interleaved layout)
+    for (int64_t n : {4096, 8192, 16384}) {
+        for (bool m : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 56, {1, 1}, n, n, m, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

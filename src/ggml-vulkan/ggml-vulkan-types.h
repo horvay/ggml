@@ -740,6 +740,8 @@ struct vk_device_struct {
     bool coopmat_acc_f16_support {};
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
+    bool coopmat_support_8x16x16_f32acc {};
+    bool coopmat_support_8x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
@@ -1001,6 +1003,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, vk_pipeline> pipeline_xe_fa_prefill;
+    vk_pipeline pipeline_xe2_fa;
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)

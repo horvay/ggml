@@ -124,6 +124,25 @@ struct vk_flash_attn_push_constants {
 
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
 
+struct vk_fa_xe2_push_constants {
+    uint32_t n_q;
+    uint32_t kv_valid;
+    uint32_t kv_len;
+    uint32_t n_head;
+    uint32_t gqa;
+    uint32_t q_tok;
+    uint32_t q_head;
+    uint32_t q_batch;
+    uint32_t k_tok;
+    uint32_t k_head;
+    uint32_t k_batch;
+    uint32_t v_tok;
+    uint32_t v_head;
+    uint32_t v_batch;
+    uint32_t o_batch;
+    float scale;
+};
+
 struct vk_fa_xe_opt_push_constants {
     uint32_t kv_seq_len;
     uint32_t activation_length;
@@ -132,8 +151,10 @@ struct vk_fa_xe_opt_push_constants {
     uint32_t qk_ratio;
     uint32_t qk_sub_groups;
     uint32_t flag;
-    uint32_t nbkv_tok;
-    uint32_t nbkv_head;
+    uint32_t nbk_tok;
+    uint32_t nbk_head;
+    uint32_t nbv_tok;
+    uint32_t nbv_head;
     uint32_t batch_stride_q;
     uint32_t batch_stride_k;
     uint32_t batch_stride_v;
