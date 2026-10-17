@@ -1,3 +1,6 @@
+#include <mutex>
+#include <map>
+#include <set>
 //
 // MIT license
 // Copyright (C) 2024 Intel Corporation
@@ -354,7 +357,10 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
-        g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
+        // Default off here: the VMM pool commits physical memory as it grows and never returns it, while sd.cpp's native
+        // XPU block library needs that memory back during sampling. The legacy pool returns all but
+        // GGML_SYCL_POOL_CACHE_MB of its cache. GGML_SYCL_ENABLE_VMM=1 restores the upstream default.
+        g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 0);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
@@ -684,6 +690,38 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Host -> device upload for set_tensor. Upstream copied every tensor into a malloc'd buffer (an mmap workaround for
+// PVC) and from there to the device, from pageable memory: about 1.5 GB/s for sd.cpp's staged 32B text encoder.
+// Now: sources in USM host/shared memory (pinned, e.g. SYCL_Host buffers) go to the device directly; other memory
+// streams through two reusable 32 MiB pinned buffers, overlapping the CPU copy with the DMA. Small pieces also keep
+// clear of the large userptr pins that hung the copy engine under memory pressure (compute-runtime#1010).
+static void ggml_sycl_upload(sycl::queue & q, void * dst, const void * src, size_t size) {
+    const auto kind = sycl::get_pointer_type(src, q.get_context());
+    if (kind == sycl::usm::alloc::host || kind == sycl::usm::alloc::shared || kind == sycl::usm::alloc::device) {
+        q.memcpy(dst, src, size).wait();
+        return;
+    }
+    constexpr size_t CHUNK = 32u << 20;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    // allocated once, for the context of the first queue (one device here); other contexts take a plain copy
+    static const sycl::context owner = q.get_context();
+    static char * const bufs[2] = {sycl::malloc_host<char>(CHUNK, q), sycl::malloc_host<char>(CHUNK, q)};
+    if (bufs[0] == nullptr || bufs[1] == nullptr || owner != q.get_context()) {
+        q.memcpy(dst, src, size).wait();
+        return;
+    }
+    sycl::event ev[2];
+    for (size_t off = 0, k = 0; off < size; off += CHUNK, k ^= 1) {
+        const size_t n = std::min(CHUNK, size - off);
+        ev[k].wait();  // the DMA that last used this buffer
+        memcpy(bufs[k], (const char *) src + off, n);
+        ev[k] = q.memcpy((char *) dst + off, bufs[k], n);
+    }
+    ev[0].wait();
+    ev[1].wait();
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -696,12 +734,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
-    char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
-    free(host_buf);
+    ggml_sycl_upload(*stream, (char *) tensor->data + offset, data, size);
 #else
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
 #endif
@@ -1743,6 +1776,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                         if (!best_diff) {
                             void * ptr = b.ptr;
                             *actual_size = b.size;
+                            cached_size -= b.size;
                             b.ptr = nullptr;
                             b.size = 0;
                             return ptr;
@@ -1755,6 +1789,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             ggml_sycl_buffer& b = buffer_pool[ibest];
             void * ptr = b.ptr;
             *actual_size = b.size;
+            cached_size -= b.size;
             b.ptr = nullptr;
             b.size = 0;
             return ptr;
@@ -1763,6 +1798,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
 
         SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr, GGML_SYCL_MEM_POOL_LEG)));
+        if (!ptr && cached_size > 0) {
+            // out of device memory: give the cached buffers back to the driver and try once more
+            evict_cached(0);
+            SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr, GGML_SYCL_MEM_POOL_LEG)));
+        }
         if (!ptr) {
             GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
             return nullptr;
@@ -1780,12 +1820,51 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         return ptr;
     }
 
+    // GGML_SYCL_POOL_CACHE_MB (default 1024): the most freed memory the pool keeps for reuse. Without a cap it kept every
+    // buffer it ever allocated, and temporaries of many sizes (convolution GEMMs, f16 copies) filled the 32 GB card.
+    static size_t cache_cap() {
+        static const size_t cap = (size_t) ggml_sycl_get_env("GGML_SYCL_POOL_CACHE_MB", 1024) << 20;
+        return cap;
+    }
+
+    size_t cached_size = 0;
+
+    // Free cached buffers, largest first, until at most `keep` bytes stay cached. Waits for the queue first: a cached
+    // buffer may still be in use by a kernel that was enqueued before it came back to the pool.
+    void evict_cached(size_t keep) {
+        if (cached_size <= keep) {
+            return;
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(qptr->wait()));
+        while (cached_size > keep) {
+            int ibig = -1;
+            for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
+                if (buffer_pool[i].ptr != nullptr && (ibig < 0 || buffer_pool[i].size > buffer_pool[ibig].size)) {
+                    ibig = i;
+                }
+            }
+            if (ibig < 0) {
+                break;
+            }
+            ggml_sycl_buffer & b = buffer_pool[ibig];
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(b.ptr, *qptr)));
+            pool_size -= b.size;
+            cached_size -= b.size;
+            b.ptr  = nullptr;
+            b.size = 0;
+        }
+    }
+
     void free(void * ptr, size_t size) override {
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                cached_size += size;
+                if (cached_size > cache_cap()) {
+                    evict_cached(cache_cap());
+                }
                 return;
             }
         }
@@ -2962,6 +3041,68 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                   src1_as_bf16.get(), DnnlGemmWrapper::to_dt<bf16_t>(),
                                   dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
         GGML_UNUSED(dst);
+        GGML_UNUSED(src1_ddq_i);
+        GGML_UNUSED(src1_padded_row_size);
+        return;
+    }
+#endif
+
+#if GGML_SYCL_DNNL
+    // f16 or quantized weights x f32 activations -> oneDNN f16 matmul with f32 accumulation and output, on the matrix
+    // engines, independent of GGML_SYCL_F16. Quantized weights are unpacked to f16; the activations are converted to
+    // f16, divided by a power of two (exact) if their max |x| would leave f16 range, and oneDNN multiplies it back.
+    // (Before, these matmuls converted both operands to f32 and ran an f32 GEMM: no matrix engines, twice the memory.)
+    // f16 activations (e.g. the im2col x kernel matmuls of 1-D convolutions) are used as they are when they are one
+    // contiguous 2-D matrix covered by this call.
+    const bool src1_f16_whole = src1->type == GGML_TYPE_F16 && ggml_is_contiguous(src1) && src1->ne[2] == 1 &&
+                                src1->ne[3] == 1 && src1_ncols == src1->ne[1];
+    if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && (src1->type == GGML_TYPE_F32 || src1_f16_whole) &&
+        g_ggml_sycl_enable_dnn && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && ldc == row_diff &&
+        dst->op_params[0] == GGML_PREC_DEFAULT) {
+        ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
+        const sycl::half * src0_ptr = (const sycl::half *) src0_dd_i;
+        if (src0->type != GGML_TYPE_F16) {
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+            GGML_ASSERT(to_fp16_sycl != nullptr);
+            src0_as_f16.alloc(row_diff * ne00);
+            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), row_diff * ne00, stream);
+            src0_ptr = src0_as_f16.get();
+        }
+        const size_t n1 = (size_t) src1_ncols * ne10;
+        ggml_sycl_pool_alloc<float> src1_amax_scale(ctx.pool(), 2);  // [0] max |x| (as uint bits), [1] scale
+        float * amax_scale = src1_amax_scale.get();
+        if (src1->type == GGML_TYPE_F16) {
+            stream->fill(amax_scale + 1, 1.0f, 1);
+            DnnlGemmWrapper::row_gemm_f16_scaled(ctx, row_diff, src1_ncols, ne10, src0_ptr,
+                                                 (const sycl::half *) src1->data, amax_scale + 1, dst_dd_i, stream);
+            GGML_UNUSED(src1_ddq_i);
+            GGML_UNUSED(src1_padded_row_size);
+            return;
+        }
+        ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool(), n1);
+        sycl::half * x16 = src1_as_f16.get();
+        stream->memset(amax_scale, 0, 2 * sizeof(float));
+        constexpr int WG = 256;
+        const size_t  ngroups = std::min<size_t>(1024, (n1 + WG - 1) / WG);
+        stream->parallel_for(sycl::nd_range<1>(ngroups * WG, WG), [=](sycl::nd_item<1> it) {
+            float m = 0.f;
+            for (size_t i = it.get_global_id(0); i < n1; i += it.get_global_range(0)) m = sycl::fmax(m, sycl::fabs(src1_ddf_i[i]));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            if (it.get_local_id(0) == 0) {
+                // non-negative floats order like their bit patterns
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> a(*(uint32_t *) amax_scale);
+                a.fetch_max(sycl::bit_cast<uint32_t>(m));
+            }
+        });
+        stream->parallel_for(sycl::range<1>(n1), [=](sycl::id<1> i) {
+            const float amax = amax_scale[0];
+            float scale = 1.f;
+            while (amax / scale > 32768.f && scale < 0x1p100f) scale *= 2.f;  // inf/NaN: give up at 2^100
+            x16[i] = (sycl::half) (src1_ddf_i[i] / scale);
+            if (i[0] == 0) amax_scale[1] = scale;
+        });
+        DnnlGemmWrapper::row_gemm_f16_scaled(ctx, row_diff, src1_ncols, ne10, src0_ptr, x16, amax_scale + 1, dst_dd_i,
+                                             stream);
         GGML_UNUSED(src1_ddq_i);
         GGML_UNUSED(src1_padded_row_size);
         return;
@@ -6050,8 +6191,95 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op);
+
+// GGML_SYCL_CHECK_GRAPH=1 (debug): before running a graph, list every node supports_op rejects (op, types, shape),
+// each signature once per process, and abort if there is any. Callers that run graphs on this backend directly
+// (no scheduler, so no CPU fallback) otherwise fail one node at a time.
+static void ggml_sycl_check_graph(int device, const ggml_cgraph * cgraph) {
+    static const bool enabled = getenv("GGML_SYCL_CHECK_GRAPH") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static std::set<std::string> seen;
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device);
+    int bad = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_backend_sycl_device_supports_op(dev, node)) {
+            continue;
+        }
+        bad++;
+        std::string sig = std::string(ggml_op_desc(node)) + " dst=" + ggml_type_name(node->type);
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+            sig += std::string(" src") + std::to_string(j) + "=" + ggml_type_name(node->src[j]->type) +
+                   (ggml_is_contiguous(node->src[j]) ? "" : "(strided)");
+        }
+        if (seen.insert(sig).second) {
+            GGML_LOG_ERROR("[sycl check] unsupported: %s  (%s, ne %lld %lld %lld %lld)\n", sig.c_str(), node->name,
+                           (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+        }
+    }
+    if (bad) {
+        GGML_ABORT("[sycl check] %d unsupported nodes in a %d-node graph", bad, cgraph->n_nodes);
+    }
+}
+
+// GGML_SYCL_PROFILE=N (debug): wait for every node and add its wall time to a per-signature table (op, dst and src
+// types, contiguity); print the top 30 every N graph computes (default 200) and on exit. Serializes the queue.
+static bool ggml_sycl_profile_enabled() {
+    static const bool enabled = getenv("GGML_SYCL_PROFILE") != nullptr;
+    return enabled;
+}
+struct ggml_sycl_profile_entry { int64_t n = 0; int64_t us = 0; };
+static std::map<std::string, ggml_sycl_profile_entry> & ggml_sycl_profile_table() {
+    static std::map<std::string, ggml_sycl_profile_entry> t;
+    return t;
+}
+static void ggml_sycl_profile_print() {
+    auto & t = ggml_sycl_profile_table();
+    std::vector<std::pair<std::string, ggml_sycl_profile_entry>> v(t.begin(), t.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
+    int64_t total = 0;
+    for (const auto & e : v) total += e.second.us;
+    GGML_LOG_INFO("[sycl profile] total %.3f s over %zu signatures\n", total / 1e6, v.size());
+    for (size_t i = 0; i < v.size() && i < 30; i++) {
+        GGML_LOG_INFO("[sycl profile] %6.2f%% %10.3f ms %8lld calls %9.1f us/call  %s\n", 100.0 * v[i].second.us / std::max<int64_t>(total, 1),
+                      v[i].second.us / 1e3, (long long) v[i].second.n, (double) v[i].second.us / v[i].second.n, v[i].first.c_str());
+    }
+}
+static int64_t ggml_sycl_profile_begin(ggml_backend_sycl_context & ctx) {
+    ctx.stream()->wait();
+    return std::max<int64_t>(1, ggml_time_us());
+}
+static void ggml_sycl_profile_end(ggml_backend_sycl_context & ctx, const ggml_tensor * node, int64_t t0) {
+    ctx.stream()->wait();
+    const int64_t us = ggml_time_us() - t0;
+    std::string sig = std::string(ggml_op_desc(node)) + " " + ggml_type_name(node->type);
+    for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+        sig += std::string(" ") + ggml_type_name(node->src[j]->type) + (ggml_is_contiguous(node->src[j]) ? "" : "(s)");
+    }
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        sig += " [" + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]) + " n=" + std::to_string(node->src[1]->ne[1]) + "]";
+    }
+    auto & e = ggml_sycl_profile_table()[sig];
+    e.n++;
+    e.us += us;
+}
+static void ggml_sycl_profile_graph_done() {
+    if (!ggml_sycl_profile_enabled()) return;
+    static int every = std::max(1, atoi(getenv("GGML_SYCL_PROFILE")) > 0 ? atoi(getenv("GGML_SYCL_PROFILE")) : 200);
+    static int n = 0;
+    static bool registered = (atexit(ggml_sycl_profile_print), true);
+    (void) registered;
+    if (++n % every == 0) ggml_sycl_profile_print();
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+    ggml_sycl_check_graph(sycl_ctx->device, cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6148,12 +6376,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        const auto prof_t0 = ggml_sycl_profile_enabled() ? ggml_sycl_profile_begin(*sycl_ctx) : 0;
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        if (prof_t0) {
+            ggml_sycl_profile_end(*sycl_ctx, node, prof_t0);
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
     }
+    ggml_sycl_profile_graph_done();
 }
 
 #ifdef GGML_SYCL_GRAPH
