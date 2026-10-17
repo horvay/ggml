@@ -528,6 +528,13 @@ static void ggml_check_sycl() try {
             }
         }
 #endif
+        // Async USM alloc/free draws on the Level Zero adapter's USM pool. With that pool off
+        // (UR_L0_DISABLE_USM_ALLOCATOR, set by ggml_sycl_disable_runtime_usm_pool), async_free throws "Enqueue process
+        // failed" (UR_RESULT_ERROR_UNKNOWN): Qwen Image's first reordered Q8_0 matmul died there on 2026-10-17. Use the
+        // synchronous path then.
+        if (getenv("UR_L0_DISABLE_USM_ALLOCATOR") != nullptr) {
+            g_ggml_sycl_use_async_mem_op = 0;
+        }
         if (CHECK_TRY_ERROR(g_all_sycl_device_count =
                             dpct::dev_mgr::instance().device_count()) != 0) {
             initialized = true;
