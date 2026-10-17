@@ -1,5 +1,90 @@
 #include "conv3d.hpp"
 
+#if GGML_SYCL_DNNL
+#include "dnnl.hpp"
+#include "dnnl_sycl.hpp"
+
+extern int g_ggml_sycl_enable_dnn;
+
+// CONV_3D as one oneDNN convolution (ncdhw activations, oidhw weights: ggml's own layouts), with no im2col buffer. With
+// f16 weights the activations are rounded to f16 first, as the im2col path does; f32 accumulation and output. The H3
+// and Wan VAE encoders spend most of their time here at 1080p (the im2col copy is 27x the input). Returns false if it
+// does not apply; GGML_SYCL_CONV3D_NAIVE=1 forces the generic path.
+static bool ggml_sycl_conv_3d_dnnl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    static const bool naive = getenv("GGML_SYCL_CONV3D_NAIVE") != nullptr;
+    if (naive || !g_ggml_sycl_enable_dnn) {
+        return false;
+    }
+    using dt  = dnnl::memory::data_type;
+    using tag = dnnl::memory::format_tag;
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    const int32_t * o = (const int32_t *) dst->op_params;
+    const int64_t s[3] = {o[2], o[1], o[0]};  // d, h, w
+    const int64_t p[3] = {o[5], o[4], o[3]};
+    const int64_t d[3] = {o[8], o[7], o[6]};
+    const int64_t C = o[9], N = o[10], OC = o[11];
+    const int64_t in[3]  = {x->ne[2], x->ne[1], x->ne[0]};
+    const int64_t k[3]   = {w->ne[2], w->ne[1], w->ne[0]};
+    const int64_t out[3] = {dst->ne[2], dst->ne[1], dst->ne[0]};
+    dnnl::memory::dims strides, pad_l, pad_r, dil;
+    for (int i = 0; i < 3; i++) {
+        strides.push_back(s[i]);
+        pad_l.push_back(p[i]);
+        // right padding that gives ggml's output size (ggml pads p on both sides and drops a partial last stride)
+        pad_r.push_back((out[i] - 1) * s[i] + (k[i] - 1) * d[i] + 1 - in[i] - p[i]);
+        dil.push_back(d[i] - 1);
+    }
+    const bool f16 = w->type == GGML_TYPE_F16;
+    const dt   ct  = f16 ? dt::f16 : dt::f32;  // compute type of activations and weights
+    // ggml's layouts; the convolution picks its own (blocked or channels-last) and reorders convert
+    const dnnl::memory::desc x_plain({N, C, in[0], in[1], in[2]}, dt::f32, tag::ncdhw);
+    const dnnl::memory::desc w_plain({OC, C, k[0], k[1], k[2]}, ct, tag::oidhw);
+    const dnnl::memory::desc y_plain({N, OC, out[0], out[1], out[2]}, dt::f32, tag::ncdhw);
+
+    queue_ptr q   = ctx.stream();
+    auto      eng = ctx.engine_dnnl(q);
+    auto      stm = ctx.stream_dnnl(q);
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    dnnl::convolution_forward::primitive_desc pd;
+    try {
+        pd = dnnl::convolution_forward::primitive_desc(
+            eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct,
+            dnnl::memory::desc(x_plain.get_dims(), ct, tag::any), dnnl::memory::desc(w_plain.get_dims(), ct, tag::any),
+            dnnl::memory::desc(y_plain.get_dims(), dt::f32, tag::any), strides, dil, pad_l, pad_r, attr);
+    } catch (const dnnl::error &) {
+        return false;
+    }
+
+    ggml_sycl_pool_alloc<uint8_t> x_buf(ctx.pool()), w_buf(ctx.pool()), y_buf(ctx.pool()), scratch(ctx.pool());
+    // operand in the convolution's layout: reorder into a pool buffer unless it already matches
+    auto prepare = [&](const dnnl::memory::desc & plain, const dnnl::memory::desc & want, void * data,
+                       ggml_sycl_pool_alloc<uint8_t> & buf) {
+        dnnl::memory src(plain, eng, data);
+        if (plain == want) {
+            return src;
+        }
+        dnnl::memory dst_mem(want, eng, buf.alloc(want.get_size()));
+        dnnl::reorder(src, dst_mem).execute(stm, src, dst_mem);
+        return dst_mem;
+    };
+    dnnl::memory x_mem = prepare(x_plain, pd.src_desc(), x->data, x_buf);
+    dnnl::memory w_mem = prepare(w_plain, pd.weights_desc(), w->data, w_buf);
+    dnnl::memory y_plain_mem(y_plain, eng, dst->data);
+    const bool   y_direct = pd.dst_desc() == y_plain;
+    dnnl::memory y_mem = y_direct ? y_plain_mem : dnnl::memory(pd.dst_desc(), eng, y_buf.alloc(pd.dst_desc().get_size()));
+    const auto scratch_md = pd.scratchpad_desc();
+    void * scratch_ptr = scratch_md.get_size() > 0 ? scratch.alloc(scratch_md.get_size()) : nullptr;
+    dnnl::convolution_forward(pd).execute(stm, {{DNNL_ARG_SRC, x_mem}, {DNNL_ARG_WEIGHTS, w_mem}, {DNNL_ARG_DST, y_mem},
+                                                {DNNL_ARG_SCRATCHPAD, dnnl::memory(scratch_md, eng, scratch_ptr)}});
+    if (!y_direct) {
+        dnnl::reorder(y_mem, y_plain_mem).execute(stm, y_mem, y_plain_mem);
+    }
+    return true;
+}
+#endif
+
 static inline int64_t ggml_sycl_conv3d_calc_patch_total(const ggml_tensor * dst, int32_t n) {
     return (int64_t) n * dst->ne[0] * dst->ne[1] * dst->ne[2];
 }
@@ -57,6 +142,12 @@ void ggml_sycl_op_conv_3d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
+
+#if GGML_SYCL_DNNL
+    if (ggml_sycl_conv_3d_dnnl(ctx, dst)) {
+        return;
+    }
+#endif
 
     const int32_t * opts = (const int32_t *) dst->op_params;
     const int32_t s0 = opts[0];
