@@ -117,7 +117,17 @@ int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
 
+// The SYCL runtime's Level Zero adapter pools freed USM device memory per context and keeps it. ggml-sycl has its own
+// pool (capped, flushable) and so do the native XPU libraries that share this process in sd.cpp, so the runtime's pool
+// only hid freed memory from them: a 46,654-token MiniMax-H3 shot filled the B70 and crawled with it on (31.8 GiB+,
+// 2026-10-17) and rendered at a 31.3 GiB peak with it off. Off unless the environment already says otherwise; must be
+// set before the first SYCL call, as the adapter reads it once.
+static void ggml_sycl_disable_runtime_usm_pool() {
+    setenv("UR_L0_DISABLE_USM_ALLOCATOR", "1", 0);
+}
+
 static ggml_sycl_device_info ggml_sycl_init() {
+    ggml_sycl_disable_runtime_usm_pool();
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
     ggml_sycl_device_info info = {};
 
@@ -7472,6 +7482,7 @@ static const ggml_backend_reg_i ggml_backend_sycl_reg_interface = {
 
 ggml_backend_reg_t ggml_backend_sycl_reg() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_reg\n");
+    ggml_sycl_disable_runtime_usm_pool();
     static ggml_backend_reg reg;
     static bool initialized = false;
 
