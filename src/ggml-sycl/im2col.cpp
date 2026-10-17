@@ -12,13 +12,25 @@
 
 #include "im2col.hpp"
 
+#include <algorithm>
+#include <climits>
+
 #define MAX_GRIDDIM_Z 65535
+
+// Groups along the z (output row) dimension: at most MAX_GRIDDIM_Z, and few enough that the whole global range fits in
+// int (DPC++ builds assume it does and throw "Provided range and/or offset does not fit in int" otherwise, e.g. for the
+// H3 VAE's 3D convolutions at 1920x1088). The kernels loop over the rest of the rows with this step.
+static int64_t im2col_grid_z(int64_t n_rows, int64_t global_xy) {
+    const int64_t fit = std::max<int64_t>(1, (int64_t) INT_MAX / global_xy);
+    GGML_ASSERT(global_xy <= INT_MAX);
+    return std::min({ n_rows, (int64_t) MAX_GRIDDIM_Z, fit });
+}
 
 template <typename T>
 static  void im2col_kernel(
         const float * x, T * dst,
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
-        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
+        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW, int64_t z_step,
         int s0, int s1, int p0, int p1, int d0, int d1) {
     auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i        = item_ct1.get_local_id(2) + item_ct1.get_group(2) * item_ct1.get_local_range(2);
@@ -32,7 +44,7 @@ static  void im2col_kernel(
     const int64_t ikw = rem - ikh * KW;
 
     const int64_t iow = item_ct1.get_group(1);
-    for (int64_t iz = item_ct1.get_group(0); iz < N_OH; iz += MAX_GRIDDIM_Z) {
+    for (int64_t iz = item_ct1.get_group(0); iz < N_OH; iz += z_step) {
         const int64_t  in = iz / OH;
         const int64_t  ioh = iz - in * OH;
 
@@ -79,7 +91,8 @@ static void im2col_sycl(const float *   x,
     const int64_t num_blocks = (IC_KH_KW + SYCL_IM2COL_BLOCK_SIZE - 1) / SYCL_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dpct::dim3    block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
+    const int64_t z_step = im2col_grid_z(N_OH, num_blocks * MIN(IC_KH_KW, SYCL_IM2COL_BLOCK_SIZE) * OW);
+    dpct::dim3    block_nums(num_blocks, OW, z_step);
     /*
     DPCT1049:73: The work-group size passed to the SYCL kernel may exceed the limit. To get the device limit, query info::device::max_work_group_size. Adjust the work-group size if needed.
     */
@@ -87,7 +100,7 @@ static void im2col_sycl(const float *   x,
                                            sycl::range<3>(1, 1, MIN(IC_KH_KW, SYCL_IM2COL_BLOCK_SIZE))),
                          [=](sycl::nd_item<3>) {
                              im2col_kernel(x, dst, IC, IW, IH, OH, OW, KW, KH, IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
-                                           s0, s1, p0, p1, d0, d1);
+                                           z_step, s0, s1, p0, p1, d0, d1);
                          });
 }
 
@@ -184,7 +197,7 @@ static  void im2col_3d_kernel(
         int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
         int64_t OH_OW, int64_t KD_KH_KW, int64_t ID_IH_IW, int64_t KH_KW, int64_t IH_IW, int64_t IC_ID_IH_IW,
         int64_t IC_KD_KH_KW, int64_t OW_KD_KH_KW, int64_t OD_OH_OW_IC_KD_KH_KW, int64_t OH_OW_IC_KD_KH_KW,
-        int64_t OW_IC_KD_KH_KW, int64_t N_OD_OH, int64_t OD_OH,
+        int64_t OW_IC_KD_KH_KW, int64_t N_OD_OH, int64_t OD_OH, int64_t z_step,
         int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
         int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2) {
     auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -201,7 +214,7 @@ static  void im2col_3d_kernel(
     const int64_t ikw = i % KW;
 
     const int64_t iow = item_ct1.get_group(1);
-    for (int64_t iz = item_ct1.get_group(0); iz < N_OD_OH; iz += MAX_GRIDDIM_Z) {
+    for (int64_t iz = item_ct1.get_group(0); iz < N_OD_OH; iz += z_step) {
         const int64_t in  = iz / OD_OH;
         const int64_t iod = (iz - in*OD_OH) / OH;
         const int64_t ioh = iz % OH;
@@ -265,7 +278,8 @@ static void im2col_3d_sycl(const float *   src,
     const int64_t OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + SYCL_IM2COL_BLOCK_SIZE - 1) / SYCL_IM2COL_BLOCK_SIZE;
-    dpct::dim3    block_nums(num_blocks, OW, MIN(N_OD_OH, MAX_GRIDDIM_Z));
+    const int64_t z_step = im2col_grid_z(N_OD_OH, num_blocks * MIN(IC_KD_KH_KW, SYCL_IM2COL_BLOCK_SIZE) * OW);
+    dpct::dim3    block_nums(num_blocks, OW, z_step);
     /*
     DPCT1049:74: The work-group size passed to the SYCL kernel may exceed the limit. To get the device limit, query info::device::max_work_group_size. Adjust the work-group size if needed.
     */
@@ -274,7 +288,7 @@ static void im2col_3d_sycl(const float *   src,
                          [=](sycl::nd_item<3>) {
                              im2col_3d_kernel(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW, OH_OW, KD_KH_KW,
                                               ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW, IC_KD_KH_KW, OW_KD_KH_KW,
-                                              OD_OH_OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH,
+                                              OD_OH_OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH, z_step,
                                               stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1,
                                               d2);
                          });
