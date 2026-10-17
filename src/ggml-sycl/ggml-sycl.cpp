@@ -1704,9 +1704,20 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     ggml_sycl_buffer buffer_pool[MAX_SYCL_BUFFERS] = {};
     size_t pool_size = 0;
 
-    explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_) : device(device_), qptr(qptr_) {}
+    // every live legacy pool, for ggml_backend_sycl_release_pool_cache()
+    static std::mutex & registry_mutex() { static std::mutex m; return m; }
+    static std::set<ggml_sycl_pool_leg *> & registry() { static std::set<ggml_sycl_pool_leg *> r; return r; }
+
+    explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_) : device(device_), qptr(qptr_) {
+        std::lock_guard<std::mutex> lock(registry_mutex());
+        registry().insert(this);
+    }
 
     ~ggml_sycl_pool_leg() {
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex());
+            registry().erase(this);
+        }
 #ifdef DEBUG_SYCL_POOL
         int    n_cached    = 0;
         size_t bytes_cached = 0;
@@ -1820,10 +1831,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         return ptr;
     }
 
-    // GGML_SYCL_POOL_CACHE_MB (default 1024): the most freed memory the pool keeps for reuse. Without a cap it kept every
+    // GGML_SYCL_POOL_CACHE_MB (default 256): the most freed memory the pool keeps for reuse. Without a cap it kept every
     // buffer it ever allocated, and temporaries of many sizes (convolution GEMMs, f16 copies) filled the 32 GB card.
     static size_t cache_cap() {
-        static const size_t cap = (size_t) ggml_sycl_get_env("GGML_SYCL_POOL_CACHE_MB", 1024) << 20;
+        static const size_t cap = (size_t) ggml_sycl_get_env("GGML_SYCL_POOL_CACHE_MB", 256) << 20;
         return cap;
     }
 
@@ -2074,6 +2085,13 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(queue_ptr qptr, int device) {
     // return pool for the host to speed up memory management
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_host(qptr, device));
+}
+
+void ggml_backend_sycl_release_pool_cache(void) {
+    std::lock_guard<std::mutex> lock(ggml_sycl_pool_leg::registry_mutex());
+    for (ggml_sycl_pool_leg * pool : ggml_sycl_pool_leg::registry()) {
+        pool->evict_cached(0);
+    }
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {

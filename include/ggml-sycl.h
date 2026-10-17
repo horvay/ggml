@@ -21,6 +21,10 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
 
+// Give every SYCL memory pool's cached (freed, reusable) blocks back to the driver. Waits for the queues first. For
+// processes that share the device with other runtimes (sd.cpp's native XPU block library), before those need memory.
+GGML_BACKEND_API void ggml_backend_sycl_release_pool_cache(void);
+
 // devide buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 
